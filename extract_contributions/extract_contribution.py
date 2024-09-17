@@ -1,240 +1,91 @@
 import requests
-import csv
-import datetime
-from collections import defaultdict
-from typing import Dict, Any, List, Optional
+import pandas as pd
+from datetime import datetime
 
-class GitHubUserData:
-    def __init__(self, token: str):
-        """
-        Inicializa a classe com o token de autenticação do GitHub.
-
-        Args:
-            token (str): O token de autenticação do GitHub.
-        """
-        self.headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
-
-    def get_user_data(self, user: str) -> Dict[str, Any]:
-        """
-        Obtém dados do usuário do GitHub usando a API GraphQL.
-
-        Args:
-            user (str): O nome de usuário do GitHub.
-
-        Returns:
-            Dict[str, Any]: Um dicionário contendo dados do usuário.
-        """
-        query = """
-        query($user: String!) {
-          user(login: $user) {
-            contributionsCollection(from: "2023-06-01T00:00:00Z", to: "2024-06-01T23:59:59Z") {
-              contributionCalendar {
-                totalContributions
-                weeks {
-                  contributionDays {
-                    date
-                    contributionCount
-                  }
-                }
-              }
-              commitContributionsByRepository {
-                contributions(first: 100) {
-                  totalCount
-                }
-              }
-              pullRequestContributionsByRepository {
-                contributions(first: 100) {
-                  totalCount
-                }
-              }
-              issueContributionsByRepository {
-                contributions(first: 100) {
-                  totalCount
-                }
-              }
-              pullRequestReviewContributionsByRepository {
-                contributions(first: 100) {
-                  totalCount
-                }
-              }
-            }
-            repositories(first: 100) {
-              totalCount
-              nodes {
-                primaryLanguage {
-                  name
-                }
-              }
-            }
-          }
-        }
-        """
-        
-        variables = {
-            "user": user
-        }
-        
-        url = "https://api.github.com/graphql"
-        response = requests.post(url, json={'query': query, 'variables': variables}, headers=self.headers)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if "errors" in data:
-                print(f"Erro ao acessar dados do usuário {user}: {data['errors']}")
-                return self._empty_user_data()
-            
-            user_data = data.get("data", {}).get("user", {})
-            if not user_data:
-                print(f"Usuário não encontrado ou sem dados: {user}")
-                return self._empty_user_data()
-            
-            return self._parse_user_data(user_data)
+def get_paginated_data(url, headers):
+    """Função genérica para coletar dados com paginação."""
+    items = []
+    while url:
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            raise Exception(f"Erro ao acessar a API: {response.json()}")
+        data = response.json()
+        items.extend(data)
+        if 'next' in response.links:
+            url = response.links['next']['url']
         else:
-            print(f"Erro ao acessar dados do usuário {user}: {response.status_code} {response.text}")
-            return self._empty_user_data()
+            break
+    return items
 
-    def _parse_user_data(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Analisa os dados do usuário obtidos da API do GitHub.
+def get_repos(org_name, token, start_year=2017):
+    """Lista todos os repositórios da organização que começam com um padrão de ano e semestre."""
+    repos_url = f"https://api.github.com/orgs/{org_name}/repos"
+    headers = {'Authorization': f'token {token}'}
+    repos = get_paginated_data(repos_url, headers)
+    current_year = datetime.now().year
 
-        Args:
-            user_data (Dict[str, Any]): Dados brutos do usuário do GitHub.
+    filtered_repos = []
+    for repo in repos:
+        repo_name = repo['name']
+        # Verifica se o nome segue o padrão de ano (AAAA.X) e ignora outros formatos
+        try:
+            year = int(repo_name.split('.')[0])
+            if start_year <= year <= current_year:
+                filtered_repos.append(repo_name)
+        except ValueError:
+            # Ignora repositórios que não têm um ano no início do nome
+            continue
 
-        Returns:
-            Dict[str, Any]: Dados analisados do usuário.
-        """
-        contributions = user_data.get("contributionsCollection", {}).get("contributionCalendar", {}).get("totalContributions", 0)
-        repositories = user_data.get("repositories", {}).get("totalCount", 0)
-        
-        languages = {}
-        for repo in user_data.get("repositories", {}).get("nodes", []):
-            primary_language = repo.get("primaryLanguage")
-            if primary_language is not None:
-                language = primary_language.get("name")
-                if language:
-                    languages[language] = languages.get(language, 0) + 1
-        
-        primary_language = max(languages, key=languages.get) if languages else "N/A"
-        
-        weekly_contributions = user_data.get("contributionsCollection", {}).get("contributionCalendar", {}).get("weeks", [])
-        
-        monthly_contributions = defaultdict(int)
-        for week in weekly_contributions:
-            for day in week.get("contributionDays", []):
-                date = datetime.datetime.strptime(day["date"], "%Y-%m-%d")
-                month = date.strftime("%Y-%m")
-                monthly_contributions[month] += day["contributionCount"]
-        
-        contribution_types = {
-            "commits": sum(repo["contributions"]["totalCount"] for repo in user_data.get("contributionsCollection", {}).get("commitContributionsByRepository", [])),
-            "pull_requests": sum(repo["contributions"]["totalCount"] for repo in user_data.get("contributionsCollection", {}).get("pullRequestContributionsByRepository", [])),
-            "issues": sum(repo["contributions"]["totalCount"] for repo in user_data.get("contributionsCollection", {}).get("issueContributionsByRepository", [])),
-            "reviews": sum(repo["contributions"]["totalCount"] for repo in user_data.get("contributionsCollection", {}).get("pullRequestReviewContributionsByRepository", []))
-        }
-        
-        return {
-            "contributions": contributions,
-            "repositories": repositories,
-            "primary_language": primary_language,
-            "monthly_contributions": dict(monthly_contributions),
-            "contribution_types": contribution_types
-        }
+    return filtered_repos
 
-    @staticmethod
-    def _empty_user_data() -> Dict[str, Any]:
-        """
-        Retorna um dicionário vazio para representar dados de usuário não encontrados ou com erro.
+def get_contributors(org_name, repo_name, token):
+    """Lista os contribuidores de um repositório específico."""
+    contributors_url = f"https://api.github.com/repos/{org_name}/{repo_name}/contributors"
+    headers = {'Authorization': f'token {token}'}
+    return get_paginated_data(contributors_url, headers)
 
-        Returns:
-            Dict[str, Any]: Dicionário vazio com valores padrão.
-        """
-        return {
-            "contributions": 0,
-            "repositories": 0,
-            "primary_language": "N/A",
-            "monthly_contributions": {},
-            "contribution_types": {}
-        }
+def get_commits(org_name, repo_name, user_login, token):
+    """Lista todos os commits de um usuário em um repositório específico."""
+    commits_url = f"https://api.github.com/repos/{org_name}/{repo_name}/commits?author={user_login}&per_page=100"
+    headers = {'Authorization': f'token {token}'}
+    return get_paginated_data(commits_url, headers)
 
-class CSVProcessor:
-    def __init__(self, input_csv: str, output_csv: str):
-        """
-        Inicializa a classe com os nomes dos arquivos CSV de entrada e saída.
+def get_pull_requests(org_name, repo_name, token):
+    """Lista todos os pull requests de um repositório."""
+    pulls_url = f"https://api.github.com/repos/{org_name}/{repo_name}/pulls?state=all&per_page=100"
+    headers = {'Authorization': f'token {token}'}
+    return get_paginated_data(pulls_url, headers)
 
-        Args:
-            input_csv (str): Nome do arquivo CSV de entrada.
-            output_csv (str): Nome do arquivo CSV de saída.
-        """
-        self.input_csv = input_csv
-        self.output_csv = output_csv
+def get_issues(org_name, repo_name, token):
+    """Lista todas as issues de um repositório."""
+    issues_url = f"https://api.github.com/repos/{org_name}/{repo_name}/issues?state=all&per_page=100"
+    headers = {'Authorization': f'token {token}'}
+    return get_paginated_data(issues_url, headers)
 
-    def read_users(self) -> List[str]:
-        """
-        Lê a lista de usuários do arquivo CSV de entrada.
+# Autenticação e configuração
+token = 'token'
+org = 'fga-eps-mds'
+repo_data_list = []
+repos = get_repos(org, token)
 
-        Returns:
-            List[str]: Lista de nomes de usuários do GitHub.
-        """
-        with open(self.input_csv, mode='r', newline='') as file:
-            reader = csv.reader(file)
-            return [row[0] for row in reader]
+# Processamento principal para cada repositório e seus contribuidores
+for repo_name in repos:
+    contributors = get_contributors(org, repo_name, token)
+    for contributor in contributors:
+        user_login = contributor['login']
+        user_commits = get_commits(org, repo_name, user_login, token)
+        pull_requests = get_pull_requests(org, repo_name, token)
+        issues = get_issues(org, repo_name, token)
+        repo_data_list.append({
+            'org': org,
+            'repo': repo_name,
+            'user': user_login,
+            'commits': len(user_commits),
+            'pull_requests': len(pull_requests),
+            'issues': len(issues)
+        })
 
-    def write_summary(self, results: List[Dict[str, Any]]):
-        """
-        Escreve o resumo dos dados dos usuários no arquivo CSV de saída.
-
-        Args:
-            results (List[Dict[str, Any]]): Lista de dicionários contendo os dados dos usuários.
-        """
-        with open(self.output_csv, mode='w', newline='') as file:
-            fieldnames = ["user", "contributions", "repositories", "primary_language", "monthly_contributions", "contribution_types"]
-            writer = csv.DictWriter(file, fieldnames=fieldnames)
-            writer.writeheader()
-            for result in results:
-                result["monthly_contributions"] = str(result["monthly_contributions"])
-                result["contribution_types"] = str(result["contribution_types"])
-                writer.writerow(result)
-        print(f"Summary written to {self.output_csv}")
-
-class GitHubContributorSummary:
-    def __init__(self, token: str, input_csv: str, output_csv: str):
-        """
-        Inicializa a classe com o token de autenticação do GitHub, nomes dos arquivos CSV de entrada e saída.
-
-        Args:
-            token (str): O token de autenticação do GitHub.
-            input_csv (str): Nome do arquivo CSV de entrada.
-            output_csv (str): Nome do arquivo CSV de saída.
-        """
-        self.github_user_data = GitHubUserData(token)
-        self.csv_processor = CSVProcessor(input_csv, output_csv)
-
-    def generate_summary(self):
-        """
-        Gera um resumo dos dados dos contribuidores do GitHub e escreve no arquivo CSV de saída.
-        """
-        users = self.csv_processor.read_users()
-        results = []
-        for user in users:
-            user_data = self.github_user_data.get_user_data(user)
-            results.append({
-                "user": user,
-                "contributions": user_data["contributions"],
-                "repositories": user_data["repositories"],
-                "primary_language": user_data["primary_language"],
-                "monthly_contributions": user_data["monthly_contributions"],
-                "contribution_types": user_data["contribution_types"]
-            })
-        self.csv_processor.write_summary(results)
-
-if __name__ == '__main__':
-    # Substitua esses valores pelos parâmetros desejados
-    token = 'your_github_token'
-    input_csv = 'users_github_lappis.csv'
-    output_csv = 'contributors_summary_lappis.csv'
-
-    summary_generator = GitHubContributorSummary(token, input_csv, output_csv)
-    summary_generator.generate_summary()
+# Criação do DataFrame e salvamento dos dados
+repo_data = pd.DataFrame(repo_data_list)
+print(repo_data)
+repo_data.to_csv('github_repo_data_complete_fixed.csv', index=False)
